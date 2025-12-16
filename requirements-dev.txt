@@ -1,0 +1,40 @@
+# Development / CI / Linting / Testing requirements for SOLO trading bot
+# Purpose: tools for linting, typing, formatting, testing, and productivity during development.
+# These are intended for a dev virtualenv / CI environment only (not production runtime).
+
+# Linters & type checkers
+ruff==0.12.0
+mypy==1.5.1
+
+# Formatter & import sorter
+black==24.3.0
+isort==5.12.0
+
+# Test framework and async test support
+pytest==7.4.2
+pytest-asyncio>=0.21,<0.23
+
+
+# Pre-commit hooks manager
+pre-commit==3.4.0
+
+# Optional CI orchestration / task runners
+tox==4.10.0
+nox==2025.10.16
+
+# Additional static-analysis / quality tools
+bandit==1.8.1        # security linting
+pip-audit==2.9.0     # dependency vulnerability checks (use available latest)
+
+# Dev helpers
+ipython>=8.18,<8.24
+
+# Dev database drivers (for testing against production DBs locally)
+psycopg2-binary==2.9.9     # Postgres (sync)
+asyncpg==0.28.0            # Postgres (async) - optional if you use async DB backends
+
+# Useful utilities
+coverage==7.4.2
+httpx==0.28.1              # already in main requirements but useful pinned in dev for testing HTTP interactions
+respx==0.20.0              # HTTPX mocking for tests
+pytest-mock==3.11.0

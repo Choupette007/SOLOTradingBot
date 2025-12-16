@@ -1,0 +1,32 @@
+SOFTWARE LICENSE AGREEMENT
+
+This Software License Agreement ("Agreement") is made effective as of [Date] ("Effective Date") by and between [Choupette Settic Industries] ("Licensor") and [End User] ("Licensee").
+
+1. LICENSE GRANT
+Subject to the terms and conditions of this Agreement, Licensor grants to Licensee a limited, non-exclusive, non-transferable, non-sublicensable license to use the provided Solana Trading Bot software ("Software") for personal use only. This license is granted for a single instance of use and shall not be used on behalf of or distributed to any third party.
+
+2. RESTRICTIONS
+Licensee shall not:
+a. Modify, reverse engineer, decompile, disassemble, or create derivative works of the Software;
+b. Redistribute, sublicense, lease, rent, sell, or otherwise transfer the Software or any portion thereof;
+c. Use the Software for any commercial purpose beyond the granted single-use license;
+d. Bypass, disable, or interfere with any licensing, authentication, or protection mechanisms within the Software;
+e. Copy or replicate the Software for use on more than one device without express written permission from Licensor.
+
+3. OWNERSHIP
+Licensor retains all rights, title, and interest in and to the Software, including but not limited to all source code, object code, algorithms, interfaces, and documentation. This Agreement does not transfer any intellectual property rights to Licensee.
+
+4. TERMINATION
+This license is effective until terminated. It will terminate automatically if Licensee breaches any part of this Agreement. Upon termination, Licensee must destroy all copies of the Software in their possession.
+
+5. DISCLAIMER OF WARRANTIES
+The Software is provided "AS IS", without warranty of any kind, express or implied. Licensor does not warrant that the Software will be error-free, uninterrupted, or meet Licensee’s specific requirements.
+
+6. LIMITATION OF LIABILITY
+In no event shall Licensor be liable for any direct, indirect, incidental, special, or consequential damages arising out of or related to the use or inability to use the Software.
+
+7. CONFIDENTIALITY
+Licensee agrees not to disclose or make available the Software or any portion thereof to any third party, except as expressly permitted by this Agreement.
+
+8. GOVERNING LAW
+This Agreement shall be governed by and construed in accordance with the laws of the United States of America, without regard to its conflict of laws principles.

@@ -1,0 +1,365 @@
+# =========================
+# SOLO Meme Coin Trading Bot - CONFIG (Dry Run) — Optimized
+# =========================
+# ---- Canonical top-level paths expected by the loader/GUI ----
+db_path: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\tokens.sqlite3"
+log_path: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\logs\\gui.log"
+
+# ---- App & Paths (Windows examples; works cross-platform) ----
+app:
+  name: "SOLOTradingBot"
+  appdata_dir: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot"
+
+# -------- Logging --------
+logging:
+  file: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\logs\\gui.log"
+  log_level: "INFO"             # DEBUG/INFO/WARN/ERROR
+  log_rotation_size_mb: 10
+  log_max_files: 5
+
+# -------- Wallet --------
+wallet:
+  address: "YOUR_WALLET_ADDRESS"      # replace with your actual public address or keep placeholder
+  private_key_env: "SOLANA_PRIVATE_KEY"
+  secret_key_env: "SOLANA_PRIVATE_KEY"
+  min_balance_sol: 0.0
+
+# -------- Solana / RPC --------
+solana:
+  rpc_url: "https://solana-rpc.publicnode.com"
+  rpc_endpoint: "https://solana-rpc.publicnode.com"
+  rpc_timeout: 20
+  commitment: "confirmed"
+
+# -------- RugCheck configuration --------
+rugcheck:
+  enabled: true
+  api_base: "https://api.rugcheck.xyz/v1"
+  allow_if_api_down: true
+  hard_fail_on_missing_auth: false
+  block_dangerous_on_trade: true
+  jwt_env: "RUGCHECK_JWT"
+  jwt_env_alt: "RUGCHECK_JWT_TOKEN"
+  api_key_env: "RUGCHECK_API_KEY"
+  danger_labels_blocklist:
+    - "dangerous"
+    - "scam"
+    - "honeypot"
+    - "malicious"
+    - "blocked"
+
+# -------- Birdeye enrichment (tunable) --------
+birdeye:
+  enable: true
+  enabled: true
+  mode: "public"                # "public" or "pro" — affects safe default RPS
+  # Requests-per-second throttle — conservative defaults for public gateway
+  rps: 2                        # lower default to avoid 429s on public/starter gateway
+  # Safety caps
+  run_cap: 800
+  cycle_cap: 400
+  api_key_env: "BIRDEYE_API_KEY"
+  force_disable_env: "FORCE_DISABLE_BIRDEYE"
+  legacy_enable_env: "BIRDEYE_ENABLE"
+  force_ipv4_env: "BIRDEYE_FORCE_IPV4"
+  # Tiny-probe and paging: increase tiny-probe to seed more items when paging fails
+  tiny_probe_limit: 20          # initial small probe (was 5)
+  page_limit: 100               # items per page when doing paged fetches (API supports up to 100)
+  max_pages_primary: 6          # primary paged pass
+  max_pages_refill: 4           # refill pass if below floor
+  # Safety/backoff tuning
+  down_backoff_default: 30.0
+  tokenlist_page_limit_cap: 300
+
+# -------- Discovery (Dexscreener, Raydium, Birdeye bulk) --------
+discovery:
+  # Dexscreener controls — tuned to reduce burstiness and reuse a discovery cache
+  dexscreener_pages: 3
+  dexscreener_per_page: 80
+  dexscreener_post_cap: 0
+
+  # Raydium controls
+  raydium_max_pairs: 400
+  raydium_page_size: 100
+  raydium_max_pools: 800
+
+  # Birdeye bulk discovery limits (reduced per your request)
+  birdeye_max_tokens: 100
+
+  # Backoff & retry tuning
+  backoff_max_retries: 5
+  backoff_base_delay: 1.0
+  backoff_jitter_enabled: true
+  backoff_max_sleep_seconds: 120
+
+  # Circuit-breaker for 429s
+  circuit_breaker_on_429: true
+  circuit_breaker_429_threshold: 5
+  circuit_breaker_cooldown_seconds: 60
+
+  # RugCheck at discovery time
+  rugcheck_in_discovery: false
+  require_rugcheck_pass: false
+
+  # Momentum minima
+  min_price_change_1h: -5.0
+  min_price_change_6h: -10.0
+  # If price-change fields are missing, treat them as 0.0 (default behavior).
+  allow_missing_price_change: true
+
+  # Price-change thresholds
+  min_liq_for_big_pct: 5000.0
+  min_vol_for_big_pct: 10000.0
+  min_price_for_pct: 0.0001
+  max_price_change: 350.0
+  max_price_change_hard: 2000.0
+
+  # Safety filters
+  hide_stables: true
+  exclude_wrapped_staking: true
+  symbol_blocklist:
+    - "USDC"
+    - "USDT"
+  name_regex_blocklist:
+    - "\\blp\\b"
+    - "staked"
+    - "staking"
+  min_liquidity_usd: 25000
+  min_market_cap_usd: 75000
+  max_market_cap_usd: 5000000
+  min_holders: 100
+
+  # Discovery/enrichment parallelism (reduce to avoid server-side rate limits)
+  batch_size: 1            # number of tokens enriched in parallel (reduce concurrency)
+  batch_sleep: 0.5         # pause between batches
+  max_tokens_per_cycle: 100
+
+# -------- Price enrichment / anti-429 safety (new) --------
+price_enrich:
+  # Use discovery-cycle cache to avoid per-token Dexscreener /search calls
+  use_dexscreener_cache: true
+  dex_cache_ttl_s: 60                     # reuse discovery results for this many seconds
+  # Hard-disable per-token Dex search fallback unless explicitly enabled in code
+  allow_dex_search_fallback: false
+  dex_token_search_concurrency: 1         # semaphore (only relevant if fallback enabled)
+  # Price cache TTLs
+  price_cache_ttl_pos_s: 60               # positive (success) TTL in seconds
+  price_cache_ttl_neg_s: 300              # negative (failure) TTL in seconds (conservative)
+  price_cache_max_size: 5000
+
+  # Token fetch / timeout tunables used by the enrichment helper
+  token_timeout: 6.0
+  small_backoff: 0.2
+  http_timeout: 8.0
+
+  # Birdeye-specific tunables expected by the helper (mirror of top-level birdeye section)
+  birdeye_rps: 2
+  tiny_probe_limit: 20
+  page_limit: 100
+  max_pages_primary: 6
+  max_pages_refill: 4
+  birdeye_short_cache_s: 30.0
+  birdeye_down_backoff_default: 30.0
+  birdeye_tokenlist_page_limit_cap: 300
+  birdeye_max_tokens: 100
+
+# -------- Signals / Indicator gates --------
+signals:
+  bbands_flip:
+    enable: true
+    reject_shorts: true
+    long_bonus_points: 15
+    long_bonus_points_narrow: 5
+    min_width: 0.015
+
+  rsi:
+    enable: true
+    period: 14
+    min_for_entry: 48
+    max_for_entry: 80
+
+  macd:
+    enable: false
+    fast: 12
+    slow: 26
+    signal: 9
+    require_cross: false
+
+  td9:
+    enable: false
+    lookback: 30
+    require_td9_up: false
+
+# -------- Scoring mode --------
+scoring:
+  mode: "midcap"
+  hard_floor:
+    enable: true
+    min_liquidity_usd: 25000.0    # aligned with discovery.min_liquidity_usd
+    min_volume_24h_usd: 10000.0   # require some trading activity (tunable)
+    min_market_cap_usd: 15000.0
+    max_market_cap_usd: 500000.0
+    allow_whitelist: true         # lets trusted tokens bypass floors
+
+# -------- Category bands (used by shortlist & cosmetic display) --------
+categories:
+  large_cap_min_usd: 500000
+  mid_cap_min_usd:   100000
+  low_cap_max_usd:    99999
+
+# -------- Shortlist selection (top-N per bucket for GUI/trader) --------
+shortlist:
+  enable_top_n_per_bucket: true
+  top_n:
+    large_cap: 5
+    mid_cap:   5
+    low_cap:   5
+    new:       5
+  new_token_age_minutes: 180
+  prefer_birdeye_present: true
+
+# Persisted-shortlist (DB fallback) safety knobs
+  persisted_fallback:
+    enabled: true                    # allow DB fallback when live discovery returns nothing
+    min_count: 6                     # require at least this many validated tokens in DB to use fallback
+    max_age_seconds: 300             # max age (seconds) of the newest persisted row to permit fallback
+    min_median_liquidity_usd: 15000  # require median liquidity across validated shortlist for fallback
+
+# -------- Trading (global runtime flags) --------
+trading:
+  enabled: true
+  dry_run: true
+  simulate: false
+  send_transactions: false
+  paper_trade_ledger: false
+  persist_dry_run_trades: false
+
+  # Test overrides (must be under this 'trading' section)
+  prefer_persisted_shortlist: false   # force live discovery (do not use DB shortlist)
+  log_candidate_reasons_info: true    # show skip reasons at INFO level
+  max_buys_per_cycle: 4   
+
+  # New buys/sells tunables added from the updated logic:
+  candidate_limit: 10
+
+  # If true: per-candidate skip reasons are logged at INFO instead of DEBUG for easier observability
+  # (kept as false here because we control via log_candidate_reasons_info)
+  log_candidate_reasons_info: false
+
+  # Buy-side per-cycle / minimums / pacing
+  # (max_buys_per_cycle above governs execution for this test run)
+  min_buy_sol: 0.02           # smallest per-token buy size (SOL)
+  buy_cooldown_s: 30.0        # seconds to sleep between buy attempts
+
+  # Sell-side per-cycle / concurrency
+  max_sells_per_cycle: 15     # cap on sells per cycle
+  sell_concurrency: 1         # 1 = sequential (safe), >1 = concurrent workers (use cautiously)
+
+# -------- Bot sizing & risk controls --------
+bot:
+  enabled: true
+  min_order_usd: 15.0
+  max_order_usd: 20.0
+  slippage_bps: 50
+  allow_shorts: false
+  db_fallback_hours: 1
+  max_open_positions: 3
+  cooldown_seconds_between_buys: 300
+  max_daily_buys: 5
+  stop_loss: 0.85
+  tp1_x: 1.30
+  tp2_x: 3.00
+  tp1_pct_to_sell: 0.25
+  tp2_pct_of_remaining: 0.60
+  breakeven_plus: 0.02
+  trail_pct_after_tp1: 0.18
+  trail_pct_moonbag: 0.40
+  no_tp_cutoff_hours: 4.0
+
+qualified_runner_filters:
+  min_liquidity_usd: 100000
+  min_volume_24h_usd: 25000
+  min_market_cap_usd: 500000
+  require_rugcheck_safe: true
+
+qualified_runner_exits:
+  stop_loss_x: 0.80
+  tp1_x: 1.25
+  tp2_x: 4.00
+  tp1_pct_to_sell: 0.10
+  tp2_pct_of_remaining: 0.30
+  breakeven_plus: 0.03
+  trail_pct_after_tp1: 0.20
+  trail_pct_moonbag: 0.50
+  no_tp_cutoff_hours: 6.0
+
+# -------- Jupiter swap execution --------
+jupiter:
+  base_url: "https://lite-api.jup.ag/swap/v1"
+  execute: true
+  quote_only: false
+  timeout_seconds: 20
+
+# -------- Alerts (Telegram) --------
+alerts:
+  enable: false
+  provider: "telegram"
+  telegram:
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    chat_id_env: "TELEGRAM_CHAT_ID"
+    notify_on:
+      buy: true
+      sell: true
+      error: true
+      filled: true
+      shortlist_update: false
+
+# -------- Database/Cache --------
+database:
+  token_cache_path: "C:\\Users\\Admin\\AppData\\Local\\SOLOTradingBot\\tokens.sqlite3"
+  prune_hours: 168
+
+# -------- GUI (Streamlit) --------
+gui:
+  auto_refresh_seconds: 20
+  discovered_tab:
+    show_top_n_per_bucket: true
+    hide_stables: true
+    show_columns:
+      - name
+      - address
+      - price
+      - liquidity
+      - market_cap
+      - volume_24h
+      - price_change_1h
+      - price_change_6h
+      - price_change_24h
+      - safety
+      - dexscreener_link
+
+# -------- Metrics / Observability --------
+metrics:
+  prorate_fees: false
+
+observability:
+  metrics_enabled: false
+  metrics_port: 9000
+  prometheus_exporter_enabled: false
+  structured_logs_enabled: false
+
+# -------- Weights (legacy) --------
+weights:
+  market_cap": 0.2      # reduce – low MC often = high risk
+  liquidity: 0.4       # increase
+  volume_24h: 0.3      # increase
+  price_change: 0.1
+
+# -------- Legacy Back-Compat (aliases) --------
+legacy:
+  birdeye_enable_env: "BIRDEYE_ENABLE"
+  force_disable_birdeye_env: "FORCE_DISABLE_BIRDEYE"
+  rugcheck_jwt_env_legacy: "RUGCHECK_JWT"
+  rugcheck_jwt_env_new: "RUGCHECK_JWT_TOKEN"
+  gui_hide_stables_flag: true
+  show_only_top_five_per_bucket: true
