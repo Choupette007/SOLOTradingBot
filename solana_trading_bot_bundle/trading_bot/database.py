@@ -20,6 +20,7 @@ from solana_trading_bot_bundle.common.constants import (
     token_cache_path,  # fallback if not set in config.yaml
 )
 
+# Canonical mint extraction helper (used to populate canonical_address DB columns)
 from .canonical import extract_canonical_mint
 
 # Defensive import of small helpers from .utils_exec to avoid circular import errors
@@ -482,11 +483,18 @@ async def _ensure_core_schema(db: aiosqlite.Connection) -> None:
         cols = []
         async with db.execute("PRAGMA table_info(eligible_tokens)") as cur:
             async for row in cur:
-                cols.append(row[1])
+                cols.append(row[1])           
         if "data" not in cols:
             await _exec(db, "ALTER TABLE eligible_tokens ADD COLUMN data TEXT;")
         if "created_at" not in cols:
             await _exec(db, "ALTER TABLE eligible_tokens ADD COLUMN created_at INTEGER;")
+        # Ensure canonical_address exists (safe/idempotent)
+        if "canonical_address" not in cols:
+            try:
+                await _exec(db, "ALTER TABLE eligible_tokens ADD COLUMN canonical_address TEXT;")
+            except Exception:
+                logger.debug("Could not add 'canonical_address' to eligible_tokens (maybe already exists)", exc_info=True)  
+            
         # Ensure canonical_address exists (safe/idempotent)
         if "canonical_address" not in cols:
             try:
@@ -1121,14 +1129,17 @@ async def get_token_trade_status(token_address: str) -> Optional[Dict]:
 
 async def upsert_eligible_token(token: Dict) -> None:
     try:
-        categories_json = json.dumps(token.get("categories", []), default=custom_json_encoder)
+        # Ensure canonical_address is present on the inserted row
+        t2 = _ensure_canonical_in_row(token, addr_field="address")
+        categories_json = json.dumps(t2.get("categories", []), default=custom_json_encoder)
         async with _connect() as db:
             await db.execute("""
                 INSERT INTO eligible_tokens (
-                    address, name, symbol, volume_24h, liquidity, market_cap, price,
+                    address, canonical_address, name, symbol, volume_24h, liquidity, market_cap, price,
                     price_change_1h, price_change_6h, price_change_24h, score, categories, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(address) DO UPDATE SET
+                    canonical_address=excluded.canonical_address,
                     name=excluded.name,
                     symbol=excluded.symbol,
                     volume_24h=excluded.volume_24h,
@@ -1142,31 +1153,32 @@ async def upsert_eligible_token(token: Dict) -> None:
                     categories=excluded.categories,
                     timestamp=excluded.timestamp;
             """, (
-                token.get("address"),
-                token.get("name", "UNKNOWN"),
-                token.get("symbol", "UNKNOWN"),
-                float(token.get("volume_24h", 0)),
-                float(token.get("liquidity", 0)),
-                float(_to_optional_float(token.get("market_cap")) or 0.0),
-                _to_optional_float(token.get("price")),
-                _to_optional_float(token.get("price_change_1h")),
-                _to_optional_float(token.get("price_change_6h")),
-                _to_optional_float(token.get("price_change_24h")),
-                float(token.get("score", 0)),
+                t2.get("address"),
+                t2.get("canonical_address"),
+                t2.get("name", "UNKNOWN"),
+                t2.get("symbol", "UNKNOWN"),
+                float(t2.get("volume_24h", 0)),
+                float(t2.get("liquidity", 0)),
+                float(_to_optional_float(t2.get("market_cap")) or 0.0),
+                _to_optional_float(t2.get("price")),
+                _to_optional_float(t2.get("price_change_1h")),
+                _to_optional_float(t2.get("price_change_6h")),
+                _to_optional_float(t2.get("price_change_24h")),
+                float(t2.get("score", 0)),
                 categories_json,
-                int(token.get("timestamp", time.time())),
+                int(t2.get("timestamp", time.time())),
             ))
 
-            json_blob = json.dumps(token, default=custom_json_encoder)
+            json_blob = json.dumps(t2, default=custom_json_encoder)
             await db.execute(
                 "UPDATE eligible_tokens "
                 "SET data = ?, created_at = COALESCE(created_at, strftime('%s','now')) "
                 "WHERE address = ?;",
-                (json_blob, token.get("address")),
+                (json_blob, t2.get("address")),
             )
 
             await db.commit()
-        logger.debug("Upserted eligible_token %s (%s)", token.get("symbol", "UNKNOWN"), token.get("address"))
+        logger.debug("Upserted eligible_token %s (%s)", t2.get("symbol", "UNKNOWN"), t2.get("address"))
     except Exception as e:
         logger.error("Failed to upsert eligible_token %s: %s\n%s",
                      token.get("address", "UNKNOWN"), e, traceback.format_exc())
@@ -1180,27 +1192,30 @@ async def bulk_upsert_eligible_tokens(tokens: List[Dict]) -> int:
             rows = []
             now = int(time.time())
             for t in tokens:
+                t2 = _ensure_canonical_in_row(t, addr_field="address")
                 rows.append((
-                    t.get("address"),
-                    t.get("name", "UNKNOWN"),
-                    t.get("symbol", "UNKNOWN"),
-                    float(t.get("volume_24h", 0)),
-                    float(t.get("liquidity", 0)),
-                    float(_to_optional_float(t.get("market_cap")) or 0.0),
-                    _to_optional_float(t.get("price")),
-                    _to_optional_float(t.get("price_change_1h")),
-                    _to_optional_float(t.get("price_change_6h")),
-                    _to_optional_float(t.get("price_change_24h")),
-                    float(t.get("score", 0)),
-                    json.dumps(t.get("categories", []), default=custom_json_encoder),
-                    int(t.get("timestamp", now)),
+                    t2.get("address"),
+                    t2.get("canonical_address"),
+                    t2.get("name", "UNKNOWN"),
+                    t2.get("symbol", "UNKNOWN"),
+                    float(t2.get("volume_24h", 0)),
+                    float(t2.get("liquidity", 0)),
+                    float(_to_optional_float(t2.get("market_cap")) or 0.0),
+                    _to_optional_float(t2.get("price")),
+                    _to_optional_float(t2.get("price_change_1h")),
+                    _to_optional_float(t2.get("price_change_6h")),
+                    _to_optional_float(t2.get("price_change_24h")),
+                    float(t2.get("score", 0)),
+                    json.dumps(t2.get("categories", []), default=custom_json_encoder),
+                    int(t2.get("timestamp", now)),
                 ))
             sql = """
                 INSERT INTO eligible_tokens (
-                    address, name, symbol, volume_24h, liquidity, market_cap, price,
+                    address, canonical_address, name, symbol, volume_24h, liquidity, market_cap, price,
                     price_change_1h, price_change_6h, price_change_24h, score, categories, timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(address) DO UPDATE SET
+                    canonical_address=excluded.canonical_address,
                     name=excluded.name,
                     symbol=excluded.symbol,
                     volume_24h=excluded.volume_24h,
@@ -1670,27 +1685,29 @@ async def persist_discovered_tokens(tokens: Any, prune_hours: int = 24) -> Optio
                     except Exception:
                         created_at_val = int(created_at_val or 0)
 
+                    tok2 = _ensure_canonical_in_row(tok, addr_field="address")
                     await db.execute(
                         """
                         INSERT OR REPLACE INTO discovered_tokens
-                        (address, data, name, symbol, created_at, creation_timestamp, price, liquidity, market_cap, v24hUSD, volume_24h, dexscreenerUrl, dsPairAddress, links)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        (address, canonical_address, data, name, symbol, created_at, creation_timestamp, price, liquidity, market_cap, v24hUSD, volume_24h, dexscreenerUrl, dsPairAddress, links)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                         """,
                         (
-                            tok.get("address"),
-                            json.dumps(tok),                       # write JSON into `data` column (schema uses `data`)
-                            tok.get("name"),
-                            tok.get("symbol"),
+                            tok2.get("address"),
+                            tok2.get("canonical_address"),
+                            json.dumps(tok2),                       # write JSON into `data` column (schema uses `data`)
+                            tok2.get("name"),
+                            tok2.get("symbol"),
                             int(created_at_val or 0),
-                            int(tok.get("creation_timestamp") or 0),
-                            float(tok.get("price") or 0.0),
-                            float(tok.get("liquidity") or 0.0),
-                            float(tok.get("market_cap") or tok.get("mc") or 0.0),
-                            float(tok.get("v24hUSD") or 0.0),
-                            float(tok.get("volume_24h") or tok.get("v24hUSD") or 0.0),
-                            tok.get("dexscreenerUrl") or "",
-                            tok.get("dsPairAddress") or "",
-                            json.dumps(tok.get("links") or []),
+                            int(tok2.get("creation_timestamp") or 0),
+                            float(tok2.get("price") or 0.0),
+                            float(tok2.get("liquidity") or 0.0),
+                            float(tok2.get("market_cap") or tok2.get("mc") or 0.0),
+                            float(tok2.get("v24hUSD") or 0.0),
+                            float(tok2.get("volume_24h") or tok2.get("v24hUSD") or 0.0),
+                            tok2.get("dexscreenerUrl") or "",
+                            tok2.get("dsPairAddress") or "",
+                            json.dumps(tok2.get("links") or []),
                         ),
                     )
                 except Exception:
@@ -1750,6 +1767,15 @@ async def ensure_eligible_tokens_schema(db: Optional[aiosqlite.Connection] = Non
         await db.execute("ALTER TABLE eligible_tokens ADD COLUMN data TEXT;")
     if "created_at" not in cols:
         await db.execute("ALTER TABLE eligible_tokens ADD COLUMN created_at INTEGER DEFAULT (strftime('%s','now'));")
+    # Ensure canonical_address exists at runtime when this helper is called
+    if "canonical_address" not in cols:
+         try:
+             await db.execute("ALTER TABLE eligible_tokens ADD COLUMN canonical_address TEXT;")
+         except Exception:
+             logger.debug(
+                 "Could not add 'canonical_address' to eligible_tokens in ensure_eligible_tokens_schema "
+                 "(maybe already exists)", exc_info=True
+             )
     await db.commit()
 
 
@@ -1829,12 +1855,27 @@ async def upsert_token_row(db: aiosqlite.Connection, table: str, token: Dict) ->
         ensure_ascii=False,
     )
 
-    sql = (
-        f"INSERT INTO {table} (address, data, created_at) "
-        "VALUES (?, ?, strftime('%s','now')) "
-        "ON CONFLICT(address) DO UPDATE SET data=excluded.data, created_at=excluded.created_at;"
-    )
-    await db.execute(sql, (addr, payload))
+    # Compute canonical once (best-effort, fall back to raw address)
+    try:
+        canon = extract_canonical_mint(addr)
+    except Exception:
+        canon = addr
+
+    # Include canonical_address when table supports it
+    if table in {"eligible_tokens", "discovered_tokens"}:
+        sql = (
+            f"INSERT INTO {table} (address, canonical_address, data, created_at) "
+            "VALUES (?, ?, ?, strftime('%s','now')) "
+            "ON CONFLICT(address) DO UPDATE SET canonical_address=excluded.canonical_address, data=excluded.data, created_at=excluded.created_at;"
+        )
+        await db.execute(sql, (addr, canon, payload))
+    else:
+        sql = (
+            f"INSERT INTO {table} (address, data, created_at) "
+            "VALUES (?, ?, strftime('%s','now')) "
+            "ON CONFLICT(address) DO UPDATE SET data=excluded.data, created_at=excluded.created_at;"
+        )
+        await db.execute(sql, (addr, payload))
 
 
 async def bulk_upsert_tokens(db: aiosqlite.Connection, table: str, tokens: List[Dict]) -> None:
