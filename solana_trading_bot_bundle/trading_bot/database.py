@@ -20,6 +20,8 @@ from solana_trading_bot_bundle.common.constants import (
     token_cache_path,  # fallback if not set in config.yaml
 )
 
+from .canonical import extract_canonical_mint
+
 # Defensive import of small helpers from .utils_exec to avoid circular import errors
 # at module import time when trading.py imports database early.
 try:
@@ -485,6 +487,12 @@ async def _ensure_core_schema(db: aiosqlite.Connection) -> None:
             await _exec(db, "ALTER TABLE eligible_tokens ADD COLUMN data TEXT;")
         if "created_at" not in cols:
             await _exec(db, "ALTER TABLE eligible_tokens ADD COLUMN created_at INTEGER;")
+        # Ensure canonical_address exists (safe/idempotent)
+        if "canonical_address" not in cols:
+            try:
+                await _exec(db, "ALTER TABLE eligible_tokens ADD COLUMN canonical_address TEXT;")
+            except Exception:
+                logger.debug("Could not add 'canonical_address' to eligible_tokens (maybe already exists)", exc_info=True)
     except Exception:
         # Non-fatal: continue even if PRAGMA or ALTER fails
         logger.debug("eligible_tokens schema backfill check failed (continuing)", exc_info=True)
@@ -576,6 +584,19 @@ async def _ensure_core_schema(db: aiosqlite.Connection) -> None:
             creation_timestamp INTEGER
         );
     """)
+    # Ensure discovered_tokens has canonical_address column
+    try:
+        dcols = []
+        async with db.execute("PRAGMA table_info(discovered_tokens)") as cur:
+            async for row in cur:
+                dcols.append(row[1])
+        if "canonical_address" not in dcols:
+            try:
+                await _exec(db, "ALTER TABLE discovered_tokens ADD COLUMN canonical_address TEXT;")
+            except Exception:
+                logger.debug("Could not add 'canonical_address' to discovered_tokens (maybe already exists)", exc_info=True)
+    except Exception:
+        logger.debug("discovered_tokens schema backfill check failed (continuing)", exc_info=True)
 
     # Indexes (idempotent)
     await _exec(db, "CREATE INDEX IF NOT EXISTS idx_eligible_tokens_timestamp ON eligible_tokens(timestamp);")
@@ -1782,6 +1803,16 @@ async def ensure_discovered_tokens_schema(db: Optional[aiosqlite.Connection] = N
     """)
     await db.commit()
 
+def _ensure_canonical_in_row(row: Dict[str, Any], addr_field: str = "address") -> Dict[str, Any]:
+    """Return a copy of row with canonical_address set (if addr present). Non-destructive."""
+    r = dict(row or {})
+    raw = r.get(addr_field)
+    if raw and not r.get("canonical_address"):
+        try:
+            r["canonical_address"] = extract_canonical_mint(raw)
+        except Exception:
+            r["canonical_address"] = raw
+    return r
 
 async def upsert_token_row(db: aiosqlite.Connection, table: str, token: Dict) -> None:
     if table not in {"shortlist_tokens", "eligible_tokens", "discovered_tokens"}:
