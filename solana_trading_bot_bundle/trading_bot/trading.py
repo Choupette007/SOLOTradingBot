@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import time
@@ -11,14 +11,17 @@ from datetime import datetime, timezone
 import re
 import signal
 import random
-from typing import TYPE_CHECKING, Any, Dict, List, Set, Optional, Callable
+from typing import TYPE_CHECKING, Any, Dict, List, Set, Optional, Callable, Iterable
 import concurrent.futures
 import sqlite3
-
+from pathlib import Path
 
 
 # Ensure module-level logger exists before any fallback logging
 logger: logging.Logger = logging.getLogger("TradingBot")
+
+
+from .canonical import extract_canonical_mint
 
 # Safe optional import of persisted-shortlist validator (normalises + re-applies hard-floor)
 try:
@@ -323,6 +326,111 @@ async def _noop_async(*a, **k):
 
 def _noop_sync(*a, **k):
     return None
+
+# sync helper that copies canonicalized rows from eligible_tokens into discovered_tokens whenever eligible_tokens is updated
+async def _sync_eligible_to_discovered_once(db_path: str | Path, *, logger: logging.Logger | None = None) -> int:
+    """Copy missing rows from eligible_tokens -> discovered_tokens using canonical_address where available.
+
+    Returns the number of inserted rows.
+    This is intentionally conservative: it only INSERTs rows that do not already exist in discovered_tokens.
+    """
+    if logger is None:
+        _logger = logging.getLogger("TradingBot")
+    else:
+        _logger = logger
+
+    dbp = str(db_path)
+    inserted = 0
+    try:
+        conn = sqlite3.connect(dbp)
+        cur = conn.cursor()
+
+        # Ensure discovered_tokens table exists
+        try:
+            cur.execute("SELECT 1 FROM discovered_tokens LIMIT 1;")
+        except sqlite3.OperationalError:
+            _logger.debug("discovered_tokens table missing; skipping eligible->discovered sync")
+            conn.close()
+            return 0
+
+        # Determine discovered_tokens columns available
+        discovered_cols = [r[1] for r in cur.execute("PRAGMA table_info(discovered_tokens);").fetchall()]
+
+        # We'll populate a minimal safe set of columns if present
+        candidate_cols = []
+        for c in ("address", "canonical_address", "symbol", "source", "created_at"):
+            if c in discovered_cols:
+                candidate_cols.append(c)
+        if not candidate_cols:
+            _logger.debug("discovered_tokens has no target columns; skipping sync")
+            conn.close()
+            return 0
+
+        col_list = ",".join(candidate_cols)
+        placeholders = ",".join("?" for _ in candidate_cols)
+
+        # Select eligible tokens (address, canonical_address, symbol, source, created_at if present)
+        eligible_cols = [r[1] for r in cur.execute("PRAGMA table_info(eligible_tokens);").fetchall()]
+        select_cols = []
+        for c in ("address", "canonical_address", "symbol", "source", "created_at"):
+            if c in eligible_cols:
+                select_cols.append(c)
+        if not select_cols:
+            _logger.debug("eligible_tokens table has no selectable columns; skipping sync")
+            conn.close()
+            return 0
+
+        sel_sql = "SELECT " + ", ".join(select_cols) + " FROM eligible_tokens"
+        rows = list(cur.execute(sel_sql).fetchall())
+
+        # For each eligible row, determine a canonical key to check existence and insert if missing
+        for row in rows:
+            # Map selected columns to their names
+            rec = dict(zip(select_cols, row))
+            raw_addr = rec.get("address")
+            canon = rec.get("canonical_address") or extract_canonical_mint(raw_addr)
+
+            # Skip if neither address nor canonical exists
+            lookup_cond = None
+            lookup_val = None
+            if canon:
+                lookup_cond = "canonical_address = ?"
+                lookup_val = canon
+            elif raw_addr:
+                lookup_cond = "address = ?"
+                lookup_val = raw_addr
+            else:
+                # nothing to insert
+                continue
+
+            exists = cur.execute(f"SELECT 1 FROM discovered_tokens WHERE {lookup_cond} LIMIT 1", (lookup_val,)).fetchone()
+            if exists:
+                continue
+
+            # Build insert values in same column order
+            values = []
+            for c in candidate_cols:
+                if c == "address":
+                    values.append(raw_addr)
+                elif c == "canonical_address":
+                    values.append(canon)
+                else:
+                    values.append(rec.get(c))
+            try:
+                cur.execute(f"INSERT INTO discovered_tokens ({col_list}) VALUES ({placeholders})", values)
+                inserted += 1
+            except Exception as e:
+                _logger.debug("failed to insert discovered_tokens row for %s: %s", lookup_val, e)
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.getLogger("TradingBot").exception("eligible->discovered sync failed: %s", e)
+        return 0
+
+    if inserted:
+        logging.getLogger("TradingBot").info("eligible->discovered sync: inserted %d rows into discovered_tokens", inserted)
+    return inserted
 
 # Static analyzer stubs for runtime-bound helpers (place after _noop_async/_noop_sync)
 from typing import Any, Callable, Awaitable, Optional, Dict, Tuple
@@ -3871,6 +3979,22 @@ async def _build_live_shortlist(
     try:
         await persist_eligible_shortlist(shortlist, prune_hours=168)
         logger.info("Persisted %d tokens into eligible_tokens (shortlist view)", len(shortlist))
+
+        # Keep discovered_tokens in sync so the GUI (which reads discovered_tokens)
+        # immediately sees the same canonical mints the buy pipeline uses.
+        try:
+            # Resolve DB path using the helper already in this module.
+            db_path = _db_path_from_config(config) if callable(globals().get("_db_path_from_config")) else _default_db_path()
+            try:
+                inserted = await _sync_eligible_to_discovered_once(db_path, logger=logger)
+                if inserted:
+                    logger.info("Synced %d eligible tokens into discovered_tokens for GUI visibility", inserted)
+            except Exception:
+                logger.exception("eligible->discovered post-persist sync failed")
+        except Exception:
+            # Non-fatal: if resolving DB path or scheduling the sync fails, continue.
+            logger.debug("Failed to run eligible->discovered sync (non-fatal)", exc_info=True)
+
     except Exception:
         logger.debug("Persisting shortlist failed", exc_info=True)
 
