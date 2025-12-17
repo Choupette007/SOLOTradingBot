@@ -7,7 +7,7 @@ import asyncio
 import time
 import math
 from collections import Counter
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Iterable
 from dataclasses import dataclass, field
 import aiohttp
 import json
@@ -39,6 +39,8 @@ from .utils_exec import (
 )
 
 logger = logging.getLogger("TradingBot")
+
+from .canonical import extract_canonical_mint
 
 # Standardize eligibility rejections at INFO so they're easy to grep in logs
 REJECT_TAG = "ELIG-REJECT"
@@ -402,6 +404,12 @@ def _coerce_token_numerics(token: Dict[str, Any]) -> Dict[str, Any]:
 
     return token
 
+def _canonical_for(addr: Optional[str]) -> Optional[str]:
+    """Return canonical mint for addr, fallback to original on error."""
+    try:
+        return extract_canonical_mint(addr)
+    except Exception:
+        return addr
 
 async def validate_persisted_shortlist(
     tokens: Iterable[Dict[str, Any]],
