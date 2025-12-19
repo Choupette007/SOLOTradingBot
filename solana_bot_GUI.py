@@ -5076,11 +5076,13 @@ with tab_pl:
         from solana_trading_bot_bundle.trading_bot.pnl_engine import (
             calculate_comprehensive_metrics,
             format_duration,
+            PROFIT_THRESHOLD,
         )
     except ImportError:
         st.error("❌ Failed to import pnl_engine. Please ensure the module is available.")
         calculate_comprehensive_metrics = None
         format_duration = None
+        PROFIT_THRESHOLD = 0.01  # Fallback constant
 
     # Try to use existing snapshot helper if it exists; otherwise fall back to a local DB query.
     try:
@@ -5438,10 +5440,10 @@ with tab_pl:
                     if pnl_col in row.index:
                         try:
                             pnl_val = float(row[pnl_col]) if row[pnl_col] is not None else 0
-                            if pnl_val > 0.01:
+                            if pnl_val > PROFIT_THRESHOLD:
                                 # Green for profit, bold
                                 styles = ['color: #00cc66; font-weight: bold'] * len(row)
-                            elif pnl_val < -0.01:
+                            elif pnl_val < -PROFIT_THRESHOLD:
                                 # Red for loss
                                 styles = ['color: #ff4444'] * len(row)
                             else:

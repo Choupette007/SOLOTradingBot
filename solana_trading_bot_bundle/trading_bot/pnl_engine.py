@@ -9,12 +9,14 @@ This module provides modularized P&L computation logic including:
 """
 from __future__ import annotations
 
-import time
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import logging
 
 logger = logging.getLogger("TradingBot.PnL")
+
+# Constants
+PROFIT_THRESHOLD = 0.01  # Minimum profit/loss to avoid rounding issues (cents)
 
 
 @dataclass
@@ -126,9 +128,9 @@ def calculate_win_rate(closed_trades: List[Dict[str, Any]]) -> Tuple[float, int,
         if profit is not None:
             try:
                 p = float(profit)
-                if p > 0.01:  # Small threshold to avoid rounding issues
+                if p > PROFIT_THRESHOLD:
                     wins += 1
-                elif p < -0.01:
+                elif p < -PROFIT_THRESHOLD:
                     losses += 1
                 else:
                     breakeven += 1
@@ -364,8 +366,18 @@ def calculate_comprehensive_metrics(
     metrics.total_trades = wins + losses + breakeven
     
     # Average win/loss
-    win_total = sum(float(t.get("profit", 0)) for t in closed_trades if float(t.get("profit", 0)) > 0)
-    loss_total = sum(abs(float(t.get("profit", 0))) for t in closed_trades if float(t.get("profit", 0)) < 0)
+    win_total = 0.0
+    loss_total = 0.0
+    
+    for t in closed_trades:
+        try:
+            profit = float(t.get("profit", 0))
+            if profit > 0:
+                win_total += profit
+            elif profit < 0:
+                loss_total += abs(profit)
+        except (ValueError, TypeError):
+            pass
     
     metrics.avg_win = win_total / wins if wins > 0 else 0.0
     metrics.avg_loss = loss_total / losses if losses > 0 else 0.0
