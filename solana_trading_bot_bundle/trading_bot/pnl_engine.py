@@ -151,7 +151,7 @@ def calculate_profit_factor(closed_trades: List[Dict[str, Any]]) -> float:
         closed_trades: List of trade dicts with 'profit' field
         
     Returns:
-        Profit factor
+        Profit factor (returns 999.99 if no losses, 0.0 if no profits)
     """
     gross_profit = 0.0
     gross_loss = 0.0
@@ -171,7 +171,7 @@ def calculate_profit_factor(closed_trades: List[Dict[str, Any]]) -> float:
     if gross_loss > 0:
         return gross_profit / gross_loss
     elif gross_profit > 0:
-        return float('inf')
+        return 999.99  # Large finite number representing "no losses"
     return 0.0
 
 
@@ -237,7 +237,7 @@ def calculate_max_drawdown(closed_trades: List[Dict[str, Any]]) -> float:
         closed_trades: List of trade dicts with 'profit' and time fields
         
     Returns:
-        Maximum drawdown as a percentage
+        Maximum drawdown as a percentage (always positive or zero)
     """
     if not closed_trades:
         return 0.0
@@ -267,9 +267,16 @@ def calculate_max_drawdown(closed_trades: List[Dict[str, Any]]) -> float:
             except (ValueError, TypeError):
                 pass
     
-    # Convert to percentage (relative to peak if peak > 0)
+    # Convert to percentage
+    # If peak > 0: normal drawdown percentage
+    # If peak <= 0: calculate percentage relative to initial capital
+    # (assuming initial capital of 1000 if all trades are losses)
     if peak > 0:
         return (max_dd / peak) * 100.0
+    elif max_dd > 0:
+        # All losses - use absolute drawdown amount as percentage relative to assumed capital
+        initial_capital = 1000.0  # Assumed initial capital
+        return (max_dd / initial_capital) * 100.0
     return 0.0
 
 

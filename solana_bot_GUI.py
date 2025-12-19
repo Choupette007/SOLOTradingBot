@@ -5271,9 +5271,9 @@ with tab_pl:
                 st.write(f"Average Win: **{fmt_usd(metrics.avg_win, compact=False)}**")
                 st.write(f"Average Loss: **{fmt_usd(metrics.avg_loss, compact=False)}**")
                 
-                # Format profit factor
-                if metrics.profit_factor == float('inf'):
-                    pf_str = "∞ (no losses)"
+                # Format profit factor - use safe check for large values
+                if metrics.profit_factor >= 999:
+                    pf_str = "999+ (no losses)"
                 else:
                     pf_str = f"{metrics.profit_factor:.2f}"
                 st.write(f"Profit Factor: **{pf_str}**")
@@ -5439,7 +5439,11 @@ with tab_pl:
                     pnl_col = "P&L (USD)"
                     if pnl_col in row.index:
                         try:
-                            pnl_val = float(row[pnl_col]) if row[pnl_col] is not None else 0
+                            # Skip if P&L is None (incomplete trade)
+                            if row[pnl_col] is None:
+                                return styles
+                            
+                            pnl_val = float(row[pnl_col])
                             if pnl_val > PROFIT_THRESHOLD:
                                 # Green for profit, bold
                                 styles = ['color: #00cc66; font-weight: bold'] * len(row)
@@ -5449,7 +5453,8 @@ with tab_pl:
                             else:
                                 # Gray for break-even
                                 styles = ['color: #888888; opacity: 0.7'] * len(row)
-                        except Exception:
+                        except (ValueError, TypeError):
+                            # Invalid data - no styling
                             pass
                     
                     return styles
