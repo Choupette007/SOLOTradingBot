@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import time
@@ -20,6 +20,42 @@ from pathlib import Path
 # Ensure module-level logger exists before any fallback logging
 logger: logging.Logger = logging.getLogger("TradingBot")
 
+import atexit
+try:
+    # Defensive import: prefer the concrete DB module so we can close the shared connection
+    # at process exit from synchronous contexts (signal handlers, tests, etc.).
+    import solana_trading_bot_bundle.trading_bot.database as db
+except Exception:
+    db = None
+
+
+def _close_shared_db_at_exit() -> None:
+    """
+    Best-effort synchronous cleanup at interpreter exit to ensure the module-shared
+    aiosqlite connection is closed and its worker thread can terminate.
+    """
+    if db is None:
+        return
+    try:
+        # Use the synchronous wrapper so this is safe from non-async exit handlers.
+        close_sync = getattr(db, "close_shared_db_sync", None)
+        if callable(close_sync):
+            close_sync()
+        else:
+            # Fallback: try to run the async close if no sync wrapper is available.
+            try:
+                asyncio.run(getattr(db, "close_shared_db")())
+            except Exception:
+                # best-effort; ignore
+                pass
+    except Exception:
+        try:
+            logger.exception("Failed to close shared DB at process exit")
+        except Exception:
+            pass
+
+
+atexit.register(_close_shared_db_at_exit)
 
 from .canonical import extract_canonical_mint
 
@@ -948,29 +984,34 @@ async def _persist_dryrun_sell_into_trade_history(
         except Exception:
             pass
 
-# Try to acquire the tech tie-breaker from eligibility; if missing, install a safe no-op fallback.
-try:
-    # Try relative import first (preferred)
-    from .eligibility import _apply_tech_tiebreaker  # preferred private name
-except Exception:
-    try:
-        # Absolute fallback
-        from solana_trading_bot_bundle.trading_bot.eligibility import _apply_tech_tiebreaker
-    except Exception:
-        try:
-            # Public name fallback (relative)
-            from .eligibility import apply_tech_tiebreaker as _apply_tech_tiebreaker
-        except Exception:
-            try:
-                # Public name fallback (absolute)
-                from solana_trading_bot_bundle.trading_bot.eligibility import apply_tech_tiebreaker as _apply_tech_tiebreaker
-            except Exception:
-                # No real implementation available in repo; provide a safe fallback
-                logger.debug("_apply_tech_tiebreaker not found in eligibility; installing no-op fallback.")
+# Ensure a safe default exists so callers cannot hit an UnboundLocalError even if imports fail.
+def _apply_tech_tiebreaker(tokens: list, config: dict, *, logger: Optional[logging.Logger] = None) -> list:
+    """Default no-op tie-breaker — overridden by import if available."""
+    return tokens
 
-                def _apply_tech_tiebreaker(tokens: list, config: dict, *, logger: Optional[logging.Logger] = None) -> list:
-                    # No-op: return tokens unchanged
-                    return tokens
+# Try to acquire the tech tie-breaker from eligibility and override the default if found.
+# This uses a simple import loop and will leave the no-op if nothing can be imported.
+for _mod_path, _attr in (
+    (".eligibility", "_apply_tech_tiebreaker"),
+    ("solana_trading_bot_bundle.trading_bot.eligibility", "_apply_tech_tiebreaker"),
+    (".eligibility", "apply_tech_tiebreaker"),
+    ("solana_trading_bot_bundle.trading_bot.eligibility", "apply_tech_tiebreaker"),
+):
+    try:
+        _pkg = __import__(_mod_path, fromlist=[_attr.split(".")[0]])
+        _candidate = getattr(_pkg, _attr, None)
+        if callable(_candidate):
+            # Assign into module globals so the name is not treated as a local
+            # variable inside the function scope (which produces UnboundLocalError
+            # when the name is referenced earlier). Using globals() avoids that.
+            globals()["_apply_tech_tiebreaker"] = _candidate  # type: ignore[assignment]
+            logger.debug("Bound _apply_tech_tiebreaker from %s.%s (via globals())", _mod_path, _attr)
+            break
+    except Exception:
+        # continue to next candidate silently
+        continue
+else:
+    logger.debug("_apply_tech_tiebreaker not found in eligibility; using no-op fallback.")
                 
 # Prefer eligibility.hard_floor implementation from module; safe fallback if unavailable
 try:
@@ -1250,23 +1291,63 @@ def _metrics_snapshot_equity_point(logger: logging.Logger | None = None) -> None
         ms = _get_metrics_store()
         if not ms:
             return
+
+        # Prefer a dedicated method if present and call via _safe_emit without spurious None arg
         if hasattr(ms, "snapshot_equity_point"):
             try:
-                _safe_emit(ms.snapshot_equity_point, None)
+                _safe_emit(ms.snapshot_equity_point)
                 return
             except Exception:
-                logger.debug("Metrics snapshot_equity_point failed", exc_info=True)
+                # use provided logger if available, otherwise module logger
+                (logger or logging.getLogger("TradingBot")).debug("Metrics snapshot_equity_point failed", exc_info=True)
+
+        # Otherwise try a generic record() API with a small payload
         if hasattr(ms, "record"):
             try:
                 _safe_emit(ms.record, {"type": "equity_snapshot", "ts": int(time.time())})
+                return
             except Exception:
-                logger.debug("Metrics snapshot.record failed", exc_info=True)
+                (logger or logging.getLogger("TradingBot")).debug("Metrics snapshot.record failed", exc_info=True)
     except Exception:
-        if logger:
-            try:
-                logger.debug("Metrics snapshot failed", exc_info=True)
-            except Exception:
-                pass
+        (logger or logging.getLogger("TradingBot")).debug("Metrics snapshot failed", exc_info=True)
+        
+def _db_path_from_config(config: Optional[dict]) -> Path:
+    """
+    Resolve a DB path from the config dictionary.
+
+    Precedence:
+      1. config['database']['token_cache_path']
+      2. config['paths']['token_cache_path']
+      3. config['token_cache_path']
+      4. token_cache_path() helper (callable or value)
+      5. _default_db_path() fallback
+    """
+    try:
+        db_cfg = (config or {}).get("database") or {}
+        paths_cfg = (config or {}).get("paths") or {}
+        raw = (
+            db_cfg.get("token_cache_path")
+            or paths_cfg.get("token_cache_path")
+            or (config or {}).get("token_cache_path")
+        )
+        if raw:
+            return Path(raw)
+    except Exception:
+        # swallow and fall through to helper-based defaults
+        pass
+
+    # token_cache_path may be a callable or a value imported from constants
+    try:
+        val = token_cache_path() if callable(token_cache_path) else token_cache_path
+        if val:
+            return Path(val)
+    except Exception:
+        # final defensive fallback
+        try:
+            return _default_db_path()  # if you have such helper in scope
+        except Exception:
+            # Last resort: current working directory 'tokens.sqlite3'
+            return Path.cwd() / "tokens.sqlite3"        
             
 # -------------------------------------------------------------------------
 # Candlestick / BB helpers (best-effort; inert if numpy/pandas absent)
@@ -3821,40 +3902,43 @@ async def _build_live_shortlist(
 
     enriched = [_coalesce_metrics(t) for t in enriched]
 
-    # 9) Apply tech tie-breaker (already present in this file)
+    # 9) Attempt to (re)bind tiebreaker & hard_floor into module globals (no local bindings)
+    # This must be module-level (not inside _build_live_shortlist) so callers in functions
+    # can use the global name without creating an accidental local binding.
     try:
-        _apply_tech_tiebreaker(enriched, config, logger=logger)
-        logger.info("Applied tech-score tie-breaker to shortlist.")
-    except Exception:
-        logger.debug("tech tie-breaker failed; continuing.", exc_info=True)
-    
-    # --- Try to acquire the tech tie-breaker from eligibility; if missing, install a safe no-op fallback.
-    try:
-        # Try relative import first (preferred)
-        from .eligibility import _apply_tech_tiebreaker, enforce_scoring_hard_floor  # preferred private name + hard-floor
+        # Prefer the local private names if available
+        from .eligibility import _apply_tech_tiebreaker as _tb, enforce_scoring_hard_floor as _hf  # type: ignore
+        globals()["_apply_tech_tiebreaker"] = _tb
+        globals()["enforce_scoring_hard_floor"] = _hf
     except Exception:
         try:
-            # Absolute fallback
-            from solana_trading_bot_bundle.trading_bot.eligibility import _apply_tech_tiebreaker, enforce_scoring_hard_floor
+            # Packaged fallback path
+            from solana_trading_bot_bundle.trading_bot.eligibility import _apply_tech_tiebreaker as _tb, enforce_scoring_hard_floor as _hf  # type: ignore
+            globals()["_apply_tech_tiebreaker"] = _tb
+            globals()["enforce_scoring_hard_floor"] = _hf
         except Exception:
             try:
-                # Public name fallback (relative)
-                from .eligibility import apply_tech_tiebreaker as _apply_tech_tiebreaker, enforce_scoring_hard_floor
+                # Public API variant name
+                from .eligibility import apply_tech_tiebreaker as _tb, enforce_scoring_hard_floor as _hf  # type: ignore
+                globals()["_apply_tech_tiebreaker"] = _tb
+                globals()["enforce_scoring_hard_floor"] = _hf
             except Exception:
                 try:
-                    # Public name fallback (absolute)
-                    from solana_trading_bot_bundle.trading_bot.eligibility import apply_tech_tiebreaker as _apply_tech_tiebreaker, enforce_scoring_hard_floor
+                    from solana_trading_bot_bundle.trading_bot.eligibility import apply_tech_tiebreaker as _tb, enforce_scoring_hard_floor as _hf  # type: ignore
+                    globals()["_apply_tech_tiebreaker"] = _tb
+                    globals()["enforce_scoring_hard_floor"] = _hf
                 except Exception:
-                    # No real implementation available in repo; provide safe fallbacks
-                    logger.debug("_apply_tech_tiebreaker/enforce_scoring_hard_floor not found in eligibility; installing no-op fallbacks.")
+                    # Last-resort: assign safe no-op fallbacks into globals
+                    def _tb_fallback(tokens: list, config: dict, *, logger: Optional[logging.Logger] = None) -> list:
+                        return list(tokens or [])
+                    def _hf_fallback(token: dict, cfg: dict) -> tuple[bool, str]:
+                        return True, "hard_floor missing (fallback allow)"
+                    globals()["_apply_tech_tiebreaker"] = _tb_fallback
+                    globals()["enforce_scoring_hard_floor"] = _hf_fallback
 
-                    def _apply_tech_tiebreaker(tokens: list, config: dict, *, logger: Optional[logging.Logger] = None) -> list:
-                        return tokens
-
-                    def enforce_scoring_hard_floor(token: dict, cfg: dict) -> tuple[bool, str]:
-                        # permissive fallback: do not block if eligibility helper missing
-                        return True, "hard_floor missing (fallback allow)"    
-
+    # Now callers can safely call globals()["_apply_tech_tiebreaker"] by name `_apply_tech_tiebreaker`
+    # without creating local binding problems.          
+                      
     # 10) Fallback shortlist if coverage is weak
     eligible_tokens_preselect: List[dict[str, Any]] | None = None
     coverage_ratio = (have_mc / max(1, n)) if n else 0.0
@@ -8877,7 +8961,7 @@ async def main() -> None:
                         pass
                     continue
                 # ===== PER-CYCLE END =====
-
+                    
     except Exception as e:  # <-- outer except: fatal error in main loop
         logger.error("Fatal error in trading.main(): %s", e, exc_info=True)
 
@@ -8938,6 +9022,25 @@ async def main() -> None:
             await _shutdown_rugcheck_client(timeout=5.0)
         except Exception:
             logger.debug("Rugcheck client shutdown attempt failed", exc_info=True)
+            
+        # Close module-shared DB connection (async) so aiosqlite worker threads can exit cleanly.
+        try:
+            if db is not None:
+                try:
+                    await db.close_shared_db()
+                except Exception:
+                    logger.debug("Failed to close shared DB connection", exc_info=True)
+        except Exception:
+            logger.debug("Error while closing shared DB connection", exc_info=True)
+
+        # Release PID / single-instance guard (best-effort)
+        try:
+            try:
+                release_single_instance()
+            except Exception:
+                logger.debug("release_single_instance failed", exc_info=True)
+        except Exception:
+            logger.debug("Error during release_single_instance", exc_info=True)    
 
 if __name__ == "__main__":
     asyncio.run(main())
