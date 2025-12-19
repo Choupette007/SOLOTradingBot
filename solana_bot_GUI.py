@@ -5077,12 +5077,14 @@ with tab_pl:
             calculate_comprehensive_metrics,
             format_duration,
             PROFIT_THRESHOLD,
+            MAX_PROFIT_FACTOR,
         )
     except ImportError:
         st.error("❌ Failed to import pnl_engine. Please ensure the module is available.")
         calculate_comprehensive_metrics = None
         format_duration = None
         PROFIT_THRESHOLD = 0.01  # Fallback constant
+        MAX_PROFIT_FACTOR = 999.99  # Fallback constant
 
     # Try to use existing snapshot helper if it exists; otherwise fall back to a local DB query.
     try:
@@ -5198,6 +5200,8 @@ with tab_pl:
     metrics = None
     if calculate_comprehensive_metrics:
         try:
+            # TODO: Retrieve actual wallet balance for accurate exposure % calculation
+            # For now, passing None which will show "N/A" for exposure percentage
             metrics = calculate_comprehensive_metrics(closed_trades, open_positions, wallet_balance=None)
         except Exception as e:
             logger.exception("Failed to calculate P&L metrics: %s", e)
@@ -5271,9 +5275,9 @@ with tab_pl:
                 st.write(f"Average Win: **{fmt_usd(metrics.avg_win, compact=False)}**")
                 st.write(f"Average Loss: **{fmt_usd(metrics.avg_loss, compact=False)}**")
                 
-                # Format profit factor - use safe check for large values
-                if metrics.profit_factor >= 999:
-                    pf_str = "999+ (no losses)"
+                # Format profit factor - use safe check for MAX_PROFIT_FACTOR
+                if metrics.profit_factor >= MAX_PROFIT_FACTOR:
+                    pf_str = f"{MAX_PROFIT_FACTOR:.0f}+ (no losses)"
                 else:
                     pf_str = f"{metrics.profit_factor:.2f}"
                 st.write(f"Profit Factor: **{pf_str}**")
@@ -5433,14 +5437,16 @@ with tab_pl:
                 # Apply styling
                 def style_pnl_row(row):
                     """Apply green/red color to profitable/losing trades"""
+                    import pandas as pd
+                    
                     styles = [''] * len(row)
                     
                     # Check P&L column
                     pnl_col = "P&L (USD)"
                     if pnl_col in row.index:
                         try:
-                            # Skip if P&L is None (incomplete trade)
-                            if row[pnl_col] is None:
+                            # Use pandas.isna for robust null checking
+                            if pd.isna(row[pnl_col]):
                                 return styles
                             
                             pnl_val = float(row[pnl_col])
