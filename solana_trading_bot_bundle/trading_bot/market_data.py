@@ -689,7 +689,7 @@ async def get_token_balance(
         # Get the ATA address using the proper token program ID
         mint_pubkey = Pubkey.from_string(token_mint)
         ata = await get_associated_token_address(wallet.pubkey(), mint_pubkey, solana_client=solana_client)
-        
+
         resp = await solana_client.get_token_account_balance(ata, commitment=Commitment("confirmed"))
         balance = float(resp.value.ui_amount) if getattr(resp, "value", None) else 0.0
 
