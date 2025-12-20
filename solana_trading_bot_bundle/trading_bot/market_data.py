@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import socket
 from typing import Any, Dict, Optional, Tuple, Union, Iterable
@@ -564,23 +565,11 @@ async def create_token_account(
         # Determine the mint's token program id (Tokenkeg or Token-2022)
         token_program_id = await get_token_program_id(token_mint, solana_client) if solana_client is not None else TOKEN_PROGRAM_ID
 
-        # Try SPL helper address derivation if available; if not, compute ATA with token_program_id
-        try:
-            from spl.token.instructions import get_associated_token_address as spl_get_ata  # type: ignore
-            # Some spl helpers accept token_program_id/token_program param; prefer a simple call first
-            try:
-                ata = spl_get_ata(owner, mint)
-            except Exception:
-                # fallback to explicit derivation using token_program_id
-                ata, _bump = Pubkey.find_program_address(
-                    [bytes(owner), bytes(token_program_id), bytes(mint)],
-                    ASSOCIATED_TOKEN_PROGRAM_ID,
-                )
-        except Exception:
-            ata, _bump = Pubkey.find_program_address(
-                [bytes(owner), bytes(token_program_id), bytes(mint)],
-                ASSOCIATED_TOKEN_PROGRAM_ID,
-            )
+        # Derive ATA address using the correct token program id
+        ata, _bump = Pubkey.find_program_address(
+            [bytes(owner), bytes(token_program_id), bytes(mint)],
+            ASSOCIATED_TOKEN_PROGRAM_ID,
+        )
 
         # Early exit if ATA exists
         if solana_client is None:
@@ -679,182 +668,6 @@ def _extract_signature(resp: Any) -> str:
         pass
     return ""
 
-async def create_token_account(
-    wallet: Keypair,
-    token_mint: Optional[str] = None,
-    solana_client: Optional[AsyncClient] = None,
-    token_data: Optional[Dict] = None,
-    *,
-    # accept alias used by trading.py
-    mint_address: Optional[str] = None,
-    # Backwards-compat: accept legacy 'token' caller kwarg (may be token dict or mint string)
-    token: Optional[Union[Dict, str]] = None,
-) -> Optional[Pubkey]:
-    """
-    Ensure the user's Associated Token Account (ATA) exists for `token_mint`.
-
-    Defensive changes:
-      - If token_mint cannot be derived, do NOT raise; log debug/warning and return None
-        (this avoids noisy tracebacks and immediate blacklisting when discovery metadata is incomplete).
-      - Retains transient RPC detection (simulation / preflight) to avoid forcing blacklisting.
-    """
-    # Accept either alias: prefer explicit token_mint/mint_address, then token (legacy), then token_data
-    if token_mint is None and mint_address is not None:
-        token_mint = mint_address
-    # token may be dict with address/mint or a raw mint string
-    if token_mint is None and token is not None:
-        try:
-            if isinstance(token, dict):
-                token_mint = token.get("address") or token.get("mint") or token.get("token_address")
-                # also populate token_data if not provided
-                if token_data is None:
-                    token_data = token
-            elif isinstance(token, str):
-                token_mint = token
-        except Exception:
-            pass
-    # If token_data provided but token_mint still None, try extracting
-    if token_mint is None and token_data is not None and isinstance(token_data, dict):
-        token_mint = token_data.get("address") or token_data.get("mint") or token_data.get("token_address")
-
-    symbol = (token_data or {}).get("symbol", "UNKNOWN")
-    try:
-        # If we still don't have a mint, treat as transient/missing metadata and return None (don't raise).
-        if not token_mint:
-            logger.debug(
-                "create_token_account: token_mint not provided/derivable for %s; skipping ATA creation",
-                symbol,
-            )
-            return None
-
-        if not _is_valid_pubkey_str(token_mint):
-            logger.warning("Malformed token mint string for %s: %s", symbol, token_mint)
-            return None
-
-        mint = Pubkey.from_string(token_mint)
-        owner = wallet.pubkey()
-
-        # Try SPL helper address derivation if available.
-        try:
-            from spl.token.instructions import get_associated_token_address as spl_get_ata  # type: ignore
-            ata = spl_get_ata(owner, mint)
-        except Exception:
-            ata = _associated_token_address(owner, mint)
-
-        # Early exit if ATA exists.
-        if solana_client is None:
-            logger.debug(
-                "create_token_account: solana_client not provided for %s (%s)", symbol, token_mint
-            )
-            return None
-
-        info = await solana_client.get_account_info(ata, commitment=Commitment("confirmed"))
-        if info.value is not None:
-            logger.debug("Token account already exists for %s (%s): %s", symbol, token_mint, ata)
-            return ata
-
-        # DRY RUN guard
-        if _env_truthy("DRY_RUN", "0"):
-            logger.info(
-                "DRY RUN: skipping ATA creation for %s (%s); pretending it exists.",
-                symbol,
-                token_mint,
-            )
-            token_account_existence_cache[f"account:{str(owner)}:{token_mint}"] = True
-            return ata
-
-        # Prefer SPL idempotent instruction when available
-        try:
-            from spl.token.instructions import (  # type: ignore
-                CreateAssociatedTokenAccountParams,
-                create_associated_token_account_idempotent,
-            )
-            ix = create_associated_token_account_idempotent(
-                CreateAssociatedTokenAccountParams(
-                    funder=owner,
-                    owner=owner,
-                    mint=mint,
-                    associated_token_program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
-                    program_id=TOKEN_PROGRAM_ID,
-                )
-            )
-        except Exception:
-            # Fallback: raw instruction (include Rent sysvar and canonical account ordering)
-            logger.debug("Falling back to raw ATA create instruction for %s (%s)", symbol, token_mint)
-            try:
-                # Sysvar Rent pubkey expected by the Associated Token program
-                RENT_SYSVAR = Pubkey.from_string(
-                    "SysvarRent111111111111111111111111111111111"
-                )
-            except Exception:
-                RENT_SYSVAR = Pubkey.from_string(
-                    "SysvarRent111111111111111111111111111111111"
-                )
-
-            ix = Instruction(
-                program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
-                accounts=[
-                    # funder / payer (signer & writable)
-                    AccountMeta(pubkey=owner, is_signer=True, is_writable=True),
-                    # associated token account (writable, not signer)
-                    AccountMeta(pubkey=ata, is_signer=False, is_writable=True),
-                    # owner of the ATA (not signer)
-                    AccountMeta(pubkey=owner, is_signer=False, is_writable=False),
-                    # token mint
-                    AccountMeta(pubkey=mint, is_signer=False, is_writable=False),
-                    # system program
-                    AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
-                    # token program
-                    AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-                    # rent sysvar (required by the associated-token program)
-                    AccountMeta(pubkey=RENT_SYSVAR, is_signer=False, is_writable=False),
-                ],
-                data=b"",  # associated-token program uses an empty instruction data for create
-            )
-
-        # Build, sign, and submit RAW bytes (opts only once)
-        recent = await solana_client.get_latest_blockhash()
-        message = Message.new_with_blockhash([ix], owner, recent.value.blockhash)
-        tx = VersionedTransaction(message, [wallet])  # signed locally
-
-        try:
-            raw_tx = bytes(tx)
-        except Exception:
-            raw_tx = tx.to_bytes()
-
-        send_opts = TxOpts(skip_preflight=False, skip_confirmation=False)
-        resp = await solana_client.send_raw_transaction(raw_tx, opts=send_opts)
-        sig = _extract_signature(resp) or str(resp)
-
-        logger.info(
-            "Created token account for %s (%s): %s, txid: %s", symbol, token_mint, ata, sig
-        )
-        token_account_existence_cache[f"account:{str(owner)}:{token_mint}"] = True
-        return ata
-    except SolanaRPCException as e:
-        # RPC-level errors (account not found, preflight failures, etc.)
-        msg = str(e)
-        logger.warning(
-            "RPC error while creating token account for %s (%s): %s", symbol, token_mint, msg
-        )
-
-        # If transient (simulation / preflight / compute limits), do NOT escalate to blacklist.
-        if _is_transient_rpc_error_text(msg):
-            logger.debug(
-                "Detected transient RPC error during ATA creation for %s: %s", token_mint, msg
-            )
-            return None
-
-        # Non-transient RPC error: log stacktrace and return None (caller is responsible for counting/blacklisting)
-        log_error_with_stacktrace(
-            f"Non-transient RPC error while creating token account for {symbol} ({token_mint})",
-            e,
-        )
-        return None
-    except Exception as e:
-        log_error_with_stacktrace(f"Failed to create token account for {symbol} ({token_mint})", e)
-        return None
-
 async def get_token_balance(
     wallet: Keypair,
     token_mint: str,
@@ -873,7 +686,10 @@ async def get_token_balance(
             logger.warning("Malformed token mint while fetching balance for %s: %s", symbol, token_mint)
             return 0.0
 
-        ata = _associated_token_address(wallet.pubkey(), Pubkey.from_string(token_mint))
+        # Get the ATA address using the proper token program ID
+        mint_pubkey = Pubkey.from_string(token_mint)
+        ata = await get_associated_token_address(wallet.pubkey(), mint_pubkey, solana_client=solana_client)
+        
         resp = await solana_client.get_token_account_balance(ata, commitment=Commitment("confirmed"))
         balance = float(resp.value.ui_amount) if getattr(resp, "value", None) else 0.0
 
