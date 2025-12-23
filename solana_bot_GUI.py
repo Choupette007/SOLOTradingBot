@@ -5065,12 +5065,26 @@ with tab_status:
 # P&L tab 
 # ---------------------------
 with tab_pl:
-    st.header("💹 P&L")
+    st.header("💹 P&L Dashboard")
 
     st.markdown(
-        "This view surfaces recent trades and an overall P&L summary. "
-        
+        "Comprehensive profit & loss analysis with realized/unrealized P&L, performance metrics, and risk insights."
     )
+
+    # Import pnl_engine
+    try:
+        from solana_trading_bot_bundle.trading_bot.pnl_engine import (
+            calculate_comprehensive_metrics,
+            format_duration,
+            PROFIT_THRESHOLD,
+            MAX_PROFIT_FACTOR,
+        )
+    except ImportError:
+        st.error("❌ Failed to import pnl_engine. Please ensure the module is available.")
+        calculate_comprehensive_metrics = None
+        format_duration = None
+        PROFIT_THRESHOLD = 0.01  # Fallback constant
+        MAX_PROFIT_FACTOR = 999.99  # Fallback constant
 
     # Try to use existing snapshot helper if it exists; otherwise fall back to a local DB query.
     try:
@@ -5079,11 +5093,12 @@ with tab_pl:
         else:
             async def _pl_local_snapshot():
                 """
-                Local fallback used when the canonical _status_snapshot() helper isn't defined yet.
-                Returns (counts, rows) to match the shape the P&L tab expects.
+                Enhanced local fallback for P&L data retrieval.
+                Returns (counts, closed_trades, open_positions) tuple.
                 """
                 counts = {"holding": 0, "sold": 0, "watchlist": 0}
-                rows = []
+                closed_trades = []
+                open_positions = []
                 try:
                     # Ensure GUI helper schemas exist (idempotent)
                     try:
@@ -5124,42 +5139,199 @@ with tab_pl:
                         except Exception:
                             counts["watchlist"] = 0
 
-                        # recent trades (normalize column names to the expected set)
+                        # Closed trades from trade_history
                         try:
                             q = (
                                 "SELECT symbol, token_address, buy_amount, sell_amount, "
                                 "buy_price, sell_price, profit, buy_time, sell_time "
                                 "FROM trade_history "
-                                "ORDER BY COALESCE(sell_time, buy_time) DESC LIMIT 50"
+                                "WHERE buy_price IS NOT NULL AND sell_price IS NOT NULL "
+                                "ORDER BY COALESCE(sell_time, buy_time) DESC LIMIT 100"
                             )
                             cur = await db.execute(q)
                             fetched = await cur.fetchall()
                             for r in fetched:
-                                # r may be sqlite3.Row-like; coerce to dict
                                 if isinstance(r, dict):
-                                    rows.append(r)
+                                    closed_trades.append(r)
                                 else:
                                     try:
-                                        rows.append(dict(r))
+                                        closed_trades.append(dict(r))
                                     except Exception:
-                                        # tuple fallback: map by position
                                         cols = ["symbol","token_address","buy_amount","sell_amount","buy_price","sell_price","profit","buy_time","sell_time"]
-                                        rows.append({cols[i]: (r[i] if i < len(r) else None) for i in range(len(cols))})
+                                        closed_trades.append({cols[i]: (r[i] if i < len(r) else None) for i in range(len(cols))})
                         except Exception:
-                            rows = []
+                            closed_trades = []
+
+                        # Open positions from tokens table
+                        try:
+                            q = (
+                                "SELECT symbol, address as token_address, buy_amount, "
+                                "buy_price, price, buy_time "
+                                "FROM tokens "
+                                "WHERE sell_time IS NULL AND buy_price IS NOT NULL "
+                                "ORDER BY buy_time DESC"
+                            )
+                            cur = await db.execute(q)
+                            fetched = await cur.fetchall()
+                            for r in fetched:
+                                if isinstance(r, dict):
+                                    open_positions.append(r)
+                                else:
+                                    try:
+                                        open_positions.append(dict(r))
+                                    except Exception:
+                                        cols = ["symbol","token_address","buy_amount","buy_price","price","buy_time"]
+                                        open_positions.append({cols[i]: (r[i] if i < len(r) else None) for i in range(len(cols))})
+                        except Exception:
+                            open_positions = []
                 except Exception:
                     pass
-                return counts, rows
+                return counts, closed_trades, open_positions
 
             snap = run_async_task(_pl_local_snapshot(), timeout=60)
     except Exception as e:
         logger.exception("Failed to load P&L snapshot: %s", e)
         st.error(f"Failed to load P&L data: {e}")
-        snap = ({'holding': 0, 'sold': 0, 'watchlist': 0}, [])
+        snap = ({'holding': 0, 'sold': 0, 'watchlist': 0}, [], [])
 
-    counts, recent_trades = snap if isinstance(snap, tuple) and len(snap) == 2 else ({'holding': 0, 'sold': 0, 'watchlist': 0}, [])
+    counts, closed_trades, open_positions = snap if isinstance(snap, tuple) and len(snap) == 3 else ({'holding': 0, 'sold': 0, 'watchlist': 0}, [], [])
 
-    # Top-line metrics
+    # Calculate comprehensive metrics using pnl_engine
+    metrics = None
+    if calculate_comprehensive_metrics:
+        try:
+            # TODO: Retrieve actual wallet balance for accurate exposure % calculation
+            # For now, passing None which will show "N/A" for exposure percentage
+            metrics = calculate_comprehensive_metrics(closed_trades, open_positions, wallet_balance=None)
+        except Exception as e:
+            logger.exception("Failed to calculate P&L metrics: %s", e)
+            st.warning(f"⚠️ Metrics calculation failed: {e}")
+
+    # ==================== TOP SUMMARY BAR ====================
+    st.subheader("📊 Performance Summary")
+    
+    if metrics:
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            st.metric(
+                "Realized P&L",
+                fmt_usd(metrics.realized_pnl, compact=False),
+                delta=None,
+                help="Total profit/loss from closed trades"
+            )
+        
+        with col2:
+            st.metric(
+                "Unrealized P&L",
+                fmt_usd(metrics.unrealized_pnl, compact=False),
+                delta=None,
+                help="Current profit/loss from open positions"
+            )
+        
+        with col3:
+            st.metric(
+                "Total P&L",
+                fmt_usd(metrics.total_pnl, compact=False),
+                delta=None,
+                help="Combined realized + unrealized P&L"
+            )
+        
+        with col4:
+            win_rate_color = "🟢" if metrics.win_rate >= 50 else "🔴"
+            st.metric(
+                "Win Rate",
+                f"{win_rate_color} {metrics.win_rate:.1f}%",
+                delta=None,
+                help="Percentage of profitable closed trades"
+            )
+        
+        with col5:
+            st.metric(
+                "Max Drawdown",
+                f"{metrics.max_drawdown_pct:.1f}%",
+                delta=None,
+                help="Maximum peak-to-trough decline in P&L"
+            )
+    else:
+        st.info("📊 Calculating metrics...")
+
+    st.markdown("---")
+
+    # ==================== EXPANDED PERFORMANCE STATS PANEL ====================
+    with st.expander("📈 Detailed Performance Statistics", expanded=True):
+        if metrics:
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.markdown("**Trade Statistics**")
+                st.write(f"Total Trades: **{metrics.total_trades}**")
+                st.write(f"Winning Trades: 🟢 **{metrics.winning_trades}**")
+                st.write(f"Losing Trades: 🔴 **{metrics.losing_trades}**")
+                st.write(f"Break-even Trades: ⚪ **{metrics.breakeven_trades}**")
+            
+            with col2:
+                st.markdown("**Profitability Metrics**")
+                st.write(f"Average Win: **{fmt_usd(metrics.avg_win, compact=False)}**")
+                st.write(f"Average Loss: **{fmt_usd(metrics.avg_loss, compact=False)}**")
+                
+                # Format profit factor - use safe check for MAX_PROFIT_FACTOR
+                if metrics.profit_factor >= MAX_PROFIT_FACTOR:
+                    pf_str = f"{MAX_PROFIT_FACTOR:.0f}+ (no losses)"
+                else:
+                    pf_str = f"{metrics.profit_factor:.2f}"
+                st.write(f"Profit Factor: **{pf_str}**")
+                
+                st.write(f"Expectancy/Trade: **{fmt_usd(metrics.expectancy, compact=False)}**")
+            
+            with col3:
+                st.markdown("**Time & Fees**")
+                if metrics.avg_hold_time_seconds > 0 and format_duration:
+                    avg_hold_str = format_duration(metrics.avg_hold_time_seconds)
+                    st.write(f"Avg Hold Time: **{avg_hold_str}**")
+                else:
+                    st.write(f"Avg Hold Time: **N/A**")
+                
+                st.write(f"Total Fees (USD): **{fmt_usd(metrics.total_fees_usd, compact=False)}**")
+                st.write(f"Total Fees (SOL): **{metrics.total_fees_sol:.4f}**")
+                
+                # Add tooltip about fees
+                st.caption("💡 Fee tracking may be limited based on available data")
+        else:
+            st.info("No performance data available yet")
+
+    st.markdown("---")
+
+    # ==================== RISK METRICS PANEL ====================
+    with st.expander("🛡️ Risk Metrics", expanded=False):
+        if metrics and open_positions:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Exposure & Positions**")
+                if metrics.current_exposure_pct > 0:
+                    st.write(f"Current Exposure: **{metrics.current_exposure_pct:.1f}%** of wallet")
+                else:
+                    st.write(f"Current Exposure: **N/A** (wallet balance needed)")
+                
+                st.write(f"Open Positions: **{len(open_positions)}**")
+                st.write(f"Positions at Loss: 🔴 **{metrics.open_positions_at_loss}**")
+            
+            with col2:
+                st.markdown("**Worst Performers**")
+                st.write(f"Largest Open Drawdown: **{fmt_usd(metrics.largest_open_drawdown, compact=False)}**")
+                
+                if metrics.worst_performing_token:
+                    st.write(f"Worst Token: **{metrics.worst_performing_token}**")
+                    st.write(f"Loss: **{fmt_usd(metrics.worst_performing_pnl, compact=False)}**")
+                else:
+                    st.write("No positions currently at loss")
+        else:
+            st.info("No open positions to analyze")
+
+    st.markdown("---")
+
+    # ==================== POSITION COUNTS ====================
     c1, c2, c3 = st.columns(3)
     c1.metric("Holding / Open", counts.get("holding", 0))
     c2.metric("Sold / Closed", counts.get("sold", 0))
@@ -5167,49 +5339,161 @@ with tab_pl:
 
     st.markdown("---")
 
-    if not recent_trades:
+    # ==================== ENHANCED TRADE TABLE ====================
+    if not closed_trades:
         st.info(
-            "No trades found in the database (trade_history table is empty). "            
+            "No closed trades found in the database. Trades will appear here once you complete your first sale."
         )
     else:
         try:
             import pandas as _pd
-            df_trades = _pd.DataFrame(recent_trades)
+            df_trades = _pd.DataFrame(closed_trades)
 
-            # Ensure columns exist
-            for col in ("symbol", "token_address", "buy_amount", "sell_amount", "buy_price", "sell_price", "profit", "buy_time", "sell_time"):
-                if col not in df_trades.columns:
-                    df_trades[col] = None
+            # Filter out rows with null buy_price or sell_price
+            df_trades = df_trades[
+                (df_trades["buy_price"].notna()) & 
+                (df_trades["sell_price"].notna())
+            ]
 
-            # Format timestamps to human readable strings using existing fmt_ts
-            def _fmt_ts_col(v):
-                try:
-                    return fmt_ts(v, with_time=True)
-                except Exception:
-                    return ""
-            if "buy_time" in df_trades.columns:
-                df_trades["buy_time"] = df_trades["buy_time"].apply(_fmt_ts_col)
-            if "sell_time" in df_trades.columns:
-                df_trades["sell_time"] = df_trades["sell_time"].apply(_fmt_ts_col)
-
-            # Aggregate total profit if available
-            try:
-                total_profit = float(df_trades["profit"].dropna().astype(float).sum())
-            except Exception:
-                total_profit = None
-
-            if total_profit is not None:
-                st.metric("Total Profit (USD)", fmt_usd(total_profit, compact=False))
+            if len(df_trades) == 0:
+                st.info("No complete trades with both buy and sell prices")
             else:
-                st.metric("Total Profit (USD)", "n/a")
+                # Ensure columns exist
+                for col in ("symbol", "token_address", "buy_amount", "sell_amount", "buy_price", "sell_price", "profit", "buy_time", "sell_time"):
+                    if col not in df_trades.columns:
+                        df_trades[col] = None
 
-            st.subheader("Recent Trades (latest 50)")
-            st_dataframe_fmt(
-                df_trades[["symbol", "token_address", "buy_amount", "sell_amount", "buy_price", "sell_price", "profit", "buy_time", "sell_time"]],
-                height_rows=min(len(df_trades), 12),
-                use_styler=True,
-            )
+                # Calculate additional columns
+                # P&L percentage
+                def calc_pnl_pct(row):
+                    try:
+                        if row["buy_price"] and row["sell_price"]:
+                            buy_p = float(row["buy_price"])
+                            sell_p = float(row["sell_price"])
+                            if buy_p > 0:
+                                return ((sell_p - buy_p) / buy_p) * 100.0
+                    except Exception:
+                        pass
+                    return None
+
+                df_trades["pnl_pct"] = df_trades.apply(calc_pnl_pct, axis=1)
+
+                # Trade side (simplified - could be enhanced with actual buy/sell tracking)
+                df_trades["side"] = "BUY→SELL"
+
+                # Duration held
+                def calc_duration(row):
+                    try:
+                        if row["buy_time"] and row["sell_time"]:
+                            duration_sec = float(row["sell_time"]) - float(row["buy_time"])
+                            if duration_sec > 0 and format_duration:
+                                return format_duration(duration_sec)
+                    except Exception:
+                        pass
+                    return "N/A"
+
+                df_trades["duration"] = df_trades.apply(calc_duration, axis=1)
+
+                # Format timestamps to human readable strings
+                def _fmt_ts_col(v):
+                    try:
+                        return fmt_ts(v, with_time=True)
+                    except Exception:
+                        return ""
+
+                if "buy_time" in df_trades.columns:
+                    df_trades["buy_time"] = df_trades["buy_time"].apply(_fmt_ts_col)
+                if "sell_time" in df_trades.columns:
+                    df_trades["sell_time"] = df_trades["sell_time"].apply(_fmt_ts_col)
+
+                # Prepare display dataframe with selected columns
+                display_cols = [
+                    "symbol", "side", "buy_price", "sell_price", 
+                    "profit", "pnl_pct", "buy_amount", "duration", 
+                    "buy_time", "sell_time"
+                ]
+                
+                # Only include columns that exist
+                display_cols = [c for c in display_cols if c in df_trades.columns]
+                df_display = df_trades[display_cols].copy()
+
+                # Rename columns for better display
+                column_renames = {
+                    "symbol": "Symbol",
+                    "side": "Side",
+                    "buy_price": "Entry Price",
+                    "sell_price": "Exit Price",
+                    "profit": "P&L (USD)",
+                    "pnl_pct": "P&L %",
+                    "buy_amount": "Amount",
+                    "duration": "Duration",
+                    "buy_time": "Entry Time",
+                    "sell_time": "Exit Time",
+                }
+                df_display = df_display.rename(columns=column_renames)
+
+                st.subheader(f"📋 Recent Trades (latest {len(df_display)})")
+
+                # Apply styling
+                def style_pnl_row(row):
+                    """Apply green/red color to profitable/losing trades"""
+                    import pandas as pd
+                    
+                    styles = [''] * len(row)
+                    
+                    # Check P&L column
+                    pnl_col = "P&L (USD)"
+                    if pnl_col in row.index:
+                        try:
+                            # Use pandas.isna for robust null checking
+                            if pd.isna(row[pnl_col]):
+                                return styles
+                            
+                            pnl_val = float(row[pnl_col])
+                            if pnl_val > PROFIT_THRESHOLD:
+                                # Green for profit, bold
+                                styles = ['color: #00cc66; font-weight: bold'] * len(row)
+                            elif pnl_val < -PROFIT_THRESHOLD:
+                                # Red for loss
+                                styles = ['color: #ff4444'] * len(row)
+                            else:
+                                # Gray for break-even
+                                styles = ['color: #888888; opacity: 0.7'] * len(row)
+                        except (ValueError, TypeError):
+                            # Invalid data - no styling
+                            pass
+                    
+                    return styles
+
+                # Format numeric columns
+                styler = df_display.style.apply(style_pnl_row, axis=1)
+                
+                # Format specific columns
+                if "Entry Price" in df_display.columns:
+                    styler = styler.format({"Entry Price": _fmt_money_for_styler})
+                if "Exit Price" in df_display.columns:
+                    styler = styler.format({"Exit Price": _fmt_money_for_styler})
+                if "P&L (USD)" in df_display.columns:
+                    styler = styler.format({"P&L (USD)": _fmt_money_for_styler})
+                if "P&L %" in df_display.columns:
+                    styler = styler.format({"P&L %": _fmt_pct_for_styler})
+
+                st_dataframe_fmt(
+                    styler,
+                    height_rows=min(len(df_display), 15),
+                    use_styler=True,
+                )
+
+                # Aggregate total profit display
+                try:
+                    total_profit = float(df_trades["profit"].dropna().astype(float).sum())
+                    st.markdown(f"**Total Realized Profit:** {fmt_usd(total_profit, compact=False)}")
+                except Exception:
+                    pass
+
         except Exception as e:
             logger.exception("Failed to render P&L table: %s", e)
-            st.write(recent_trades)
+            st.error(f"Error rendering trade table: {e}")
+            st.write(closed_trades[:10])  # Show first 10 as fallback
+
 
